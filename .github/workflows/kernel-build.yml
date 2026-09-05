@@ -101,6 +101,14 @@ jobs:
           arch/arm64/configs/vendor/xiaomi_GKI.config \
           arch/arm64/configs/vendor/mayfly_GKI.config
 
+        # Apply stock PhoenyxCore config as base (real working config from device)
+        # This replaces the merged config with stock config to ensure full compatibility
+        cp out/.config out/.config.merged
+        gunzip -kc arch/arm64/configs/vendor/stock_phoenyx_config.gz > out/.config.stock 2>/dev/null || \
+          cp arch/arm64/configs/vendor/stock_phoenyx.config out/.config.stock
+        # Merge stock config on top to ensure all required options are set
+        scripts/kconfig/merge_config.sh -m -O out out/.config out/.config.stock
+
         make O=out ARCH=arm64 \
           CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
