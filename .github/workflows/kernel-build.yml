@@ -1,0 +1,179 @@
+name: Kernel Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable debug mode'
+        required: false
+        default: 'false'
+
+env:
+  DEVICE_CODENAME: mayfly
+  ARCH: arm64
+  DEFCONFIG: gki_defconfig
+  TOOLCHAIN_TYPE: clang
+  KERNEL_VERSION: 5.10.10
+  KERNEL_OUT: out
+  # ccache tweaks for fast rebuilds
+  CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+  CCACHE_NOHASHDIR: "true"
+  CCACHE_HARDLINK: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y \
+          build-essential \
+          bc \
+          binutils \
+          ccache \
+          gcc-aarch64-linux-gnu \
+          git \
+          curl \
+          xz-utils \
+          zip \
+          python3 \
+          python3-pip
+        pip3 install --user pyyaml
+
+    - name: Setup toolchain
+      run: |
+        mkdir -p toolchain
+        cd toolchain
+        # Download official LLVM/Clang 17.0.6
+        curl -sL "https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz" -o llvm.tar.xz
+        tar -xJf llvm.tar.xz
+        rm llvm.tar.xz
+        mv clang+llvm-* clang
+        echo "PATH=$(pwd)/clang/bin:$PATH" >> $GITHUB_ENV
+
+
+    - name: Download AnyKernel3
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3 \
+          || echo "::warning::AnyKernel3 clone failed, will upload built Image only"
+
+    - name: Verify KSU Integration
+      run: |
+        echo "Checking for KSU integration..."
+        if [ ! -d "drivers/kernelsu" ]; then
+          echo "::error::KSU not integrated: drivers/kernelsu missing."
+          echo "  Run: kernel-builder/scripts/ksu-submodule-setup.sh"
+          exit 1
+        fi
+        echo "KSU found in drivers/kernelsu/"
+        if ! git ls-files --stage --error-unmatch KernelSU >/dev/null 2>&1; then
+          echo "::warning::KernelSU is not a git submodule."
+        elif [ "$(git submodule status KernelSU 2>&1 | cut -c1)" = "-" ]; then
+          echo "::warning::KernelSU submodule not initialized. Commit .gitmodules so checkout uses 'submodules: recursive'."
+        else
+          echo "KernelSU is a registered git submodule (OK)."
+        fi
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2.22
+      with:
+        key: build-kernel-${{ env.DEVICE_CODENAME }}-${{ env.TOOLCHAIN_TYPE }}
+        max-size: 2G
+
+    - name: Build kernel
+      run: |
+        make O=out ARCH=arm64 \
+          CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- gki_defconfig
+
+        # Merge device fragments for Xiaomi 12S (mayfly)
+        scripts/kconfig/merge_config.sh -m -O out out/.config \
+          arch/arm64/configs/vendor/waipio_GKI.config \
+          arch/arm64/configs/vendor/xiaomi_GKI.config \
+          arch/arm64/configs/vendor/mayfly_GKI.config
+
+        make O=out ARCH=arm64 \
+          CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+        make O=out -j$(nproc --all) ARCH=arm64 TARGET_PRODUCT=mayfly \
+          CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
+    - name: ccache stats
+      run: |
+        ccache -s
+        echo "### Ccache stats" >> $GITHUB_STEP_SUMMARY
+        ccache -s | grep -E "Hits|Misses|Cache size|Hit rate" | sed 's/^/- \|/' >> $GITHUB_STEP_SUMMARY
+
+
+    - name: Package AnyKernel3
+      run: |
+        if [ ! -d AnyKernel3 ]; then
+          echo "::warning::AnyKernel3 not available, skipping zip packaging"
+          exit 0
+        fi
+
+        cd AnyKernel3
+        # Copy kernel Image
+        if [ -f ../out/arch/arm64/boot/Image ]; then
+          cp ../out/arch/arm64/boot/Image .
+        elif [ -f ../out/arch/arm64/boot/Image.gz-dtb ]; then
+          cp ../out/arch/arm64/boot/Image.gz-dtb .
+        elif [ -f ../out/arch/arm64/boot/zImage ]; then
+          cp ../out/arch/arm64/boot/zImage .
+        fi
+
+        # Copy dtbs if exists
+        if [ -d ../out/arch/arm64/boot/dts ]; then
+          mkdir -p dtbs
+          cp ../out/arch/arm64/boot/dts/*/*.dtb dtbs/ 2>/dev/null || true
+        fi
+
+        # Create zip
+        zip -r kernel.zip *
+
+        echo "KERNEL_ZIP=kernel.zip" >> $GITHUB_ENV
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-artifacts
+        path: |
+          AnyKernel3/kernel.zip
+          anykernel3/kernel.zip
+          out/arch/arm64/boot/Image
+          out/arch/arm64/boot/Image.gz-dtb
+          out/arch/arm64/boot/zImage
+          out/Module.symvers
+        if-no-files-found: ignore
+
+    - name: Build Summary
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- Device: ${{ env.DEVICE_CODENAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Kernel: ${{ env.KERNEL_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Architecture: ${{ env.ARCH }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Toolchain: ${{ env.TOOLCHAIN_TYPE }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Enabled Config Features" >> $GITHUB_STEP_SUMMARY
+        if [ -f out/.config ]; then
+          if grep -qE '^CONFIG_KSU.*=y$' out/.config; then
+            grep -E '^CONFIG_KSU.*=y$' out/.config | sed 's/=y$//; s/^/- `/; s/$/`: enabled/' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- No CONFIG_KSU* features found" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "- out/.config not found" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ReSukiSU Manager" >> $GITHUB_STEP_SUMMARY
+        echo "- [Download ReSukiSU Manager](https://nightly.link/ReSukiSU/ReSukiSU/workflows/build-manager/main)" >> $GITHUB_STEP_SUMMARY
+        echo "- [ReSukiSU Guide](https://resukisu.github.io/guide/install.html)" >> $GITHUB_STEP_SUMMARY

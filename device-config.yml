@@ -1,0 +1,22 @@
+device:
+  codename: "mayfly"
+  arch: "arm64"
+  defconfig: "gki_defconfig"
+
+toolchain:
+  type: "clang"
+  clang_version: "17.0.6"
+  gcc_prebuilt: "none"
+
+kernel:
+  version: "5.10"
+  anykernel: true
+
+ksu:
+  integrated: true
+
+upload:
+  vmlinux: false
+
+github:
+  branch: "lineage-23.2"
